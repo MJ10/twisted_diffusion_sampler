@@ -271,37 +271,38 @@ def run_particle_filter(sampler, motif_contig_info, P=4, sample_id=0,
         keep_motif_seq=keep_motif_seq, insert_motif_at_t0=insert_motif_at_t0)
 
 
-def sample_fn(sampler, motif_contig_info, batch_size, 
+def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size, 
            keep_motif_seq=False, verbose=False, insert_motif_at_t0=False):
-    sampler.PF_cache = {}
+    posterior_sampler.PF_cache = {}
     motif_segments = [torch.tensor(motif_segment, dtype=torch.float64) for motif_segment in motif_contig_info['motif_segments']]
     rigids_motif = eu.remove_com_from_tensor_7(
-        torch.cat([motif_segment.to(sampler.device) for motif_segment in motif_segments], dim=0))
-    sampler.PF_cache["rigids_motif"] = rigids_motif
+        torch.cat([motif_segment.to(posterior_sampler.device) for motif_segment in motif_segments], dim=0))
+    posterior_sampler.PF_cache["rigids_motif"] = rigids_motif
 
-    if sampler._infer_conf.motif_scaffolding.use_contig_for_placement:
-        num_DOF = sampler._infer_conf.motif_scaffolding.num_rots*sampler._infer_conf.motif_scaffolding.max_offsets
+    if posterior_sampler._infer_conf.motif_scaffolding.use_contig_for_placement:
+        num_DOF = posterior_sampler._infer_conf.motif_scaffolding.num_rots*posterior_sampler._infer_conf.motif_scaffolding.max_offsets
         assert num_DOF == 1, f"sampling using contig supported only for no DOF {num_DOF}"
 
-    assert not sampler._infer_conf.motif_scaffolding.use_replacement, "replacement not supported for PF"
+    assert not posterior_sampler._infer_conf.motif_scaffolding.use_replacement, "replacement not supported for PF"
+    
     # Check if number of possible rotations and translations is 1 and sample motif if so
-    if sampler._infer_conf.motif_scaffolding.num_rots == 1 and sampler._infer_conf.motif_scaffolding.max_offsets == 1:
-        motif_locations, length = sampler.motif_locations_and_length(
-            motif_segments, motif_contig_info, P)
+    if posterior_sampler._infer_conf.motif_scaffolding.num_rots == 1 and posterior_sampler._infer_conf.motif_scaffolding.max_offsets == 1:
+        motif_locations, length = posterior_sampler.motif_locations_and_length(
+            motif_segments, motif_contig_info, batch_size)
     else:
         motif_locations, length = None, motif_contig_info['length_fixed']
-    sampler.PF_cache["motif_locations"] = motif_locations
-    sampler.PF_cache["length"] = length
+    # posterior_sampler.PF_cache["motif_locations"] = motif_locations
+    # posterior_sampler.PF_cache["length"] = length
 
     # Compute vectorized function for degrees of freedom computation
     F, all_motif_locations, all_rots = twisting.motif_offsets_and_rots_vec_F(
-        length, motif_segments, motif_locations=motif_locations, num_rots=sampler._infer_conf.motif_scaffolding.num_rots,
-        device=sampler.device,
-        max_offsets=sampler._infer_conf.motif_scaffolding.max_offsets,
+        length, motif_segments, motif_locations=motif_locations, num_rots=posterior_sampler._infer_conf.motif_scaffolding.num_rots,
+        device=posterior_sampler.device,
+        max_offsets=posterior_sampler._infer_conf.motif_scaffolding.max_offsets,
         return_rots=True)
-    sampler.PF_cache["F"] = F
-    sampler.PF_cache["all_motif_locations"] = all_motif_locations
-    sampler.PF_cache["all_rots"] = all_rots
+    # posterior_sampler.PF_cache["F"] = F
+    # posterior_sampler.PF_cache["all_motif_locations"] = all_motif_locations
+    # posterior_sampler.PF_cache["all_rots"] = all_rots
 
 
     # Initialize sample_feats
@@ -320,100 +321,90 @@ def sample_fn(sampler, motif_contig_info, batch_size,
 
     # Add move to torch and GPU
     sample_feats = tree.map_structure(lambda x: x if (x is None or torch.is_tensor(x)) else torch.tensor(x), sample_feats)
-    sample_feats = tree.map_structure(lambda x: x if x is None else x.to(sampler.device), sample_feats)
-    sampler.PF_cache["sample_feats"] = sample_feats
-    sampler.PF_cache["motif_contig_info"] = motif_contig_info
+    sample_feats = tree.map_structure(lambda x: x if x is None else x.to(posterior_sampler.device), sample_feats)
 
-    sample_length = sampler.PF_cache['length']
-    ref_sample = sampler.diffuser.sample_ref(
-        n_samples=sample_length * batch_size,
+    ref_sample = posterior_sampler.diffuser.sample_ref(
+        n_samples=length * batch_size,
         as_tensor_7=True)
-    rigid_t = Rigid.from_tensor_7(ref_sample['rigids_t'].reshape(batch_size, sample_length, 7))
-    sampler.PF_cache['sample_feats']['R_t'] = rigid_t.get_rots().get_rot_mats().to(torch.float64)
-    sampler.PF_cache['sample_feats']['trans_t'] = rigid_t.get_trans().to(torch.float64)
-    sampler.PF_cache['sample_feats']['rigids_t'] = rigid_t.to_tensor_7().to(torch.float64)
-    sample_feats = sampler.PF_cache['sample_feats']
-
+    rigid_t = Rigid.from_tensor_7(ref_sample['rigids_t'].reshape(batch_size, length, 7))
+    sample_feats['R_t'] = rigid_t.get_rots().get_rot_mats().to(torch.float64)
+    sample_feats['trans_t'] = rigid_t.get_trans().to(torch.float64)
+    sample_feats['rigids_t'] = rigid_t.to_tensor_7().to(torch.float64)
     # Move all tensors in sample_feats onto device
     for k, v in sample_feats.items():
         if isinstance(v, torch.Tensor):
-            sample_feats[k] = v.to(sampler.device)
+            sample_feats[k] = v.to(posterior_sampler.device)
 
     t_cts = 1.0
-    self_conditioning = sampler.exp._model_conf.embed.embed_self_conditioning and not sampler._infer_conf.motif_scaffolding.no_self_conditioning
+    self_conditioning = posterior_sampler.exp._model_conf.embed.embed_self_conditioning and not posterior_sampler._infer_conf.motif_scaffolding.no_self_conditioning
     if self_conditioning:
-        sample_feats = sampler.exp._set_t_feats(
+        sample_feats = posterior_sampler.exp._set_t_feats(
             sample_feats, t_cts, sample_feats['t_placeholder'])
-        sample_feats = sampler.exp._self_conditioning(sample_feats)
-        sampler.PF_cache['sample_feats'] = sample_feats
+        sample_feats = posterior_sampler.exp._self_conditioning(sample_feats)
+        # posterior_sampler.PF_cache['sample_feats'] = sample_feats
     
     xt = rigid_t.to_tensor_7().cpu().detach()
 
-    num_t = sampler._diff_conf.num_t
+    num_t = posterior_sampler._diff_conf.num_t
     T = num_t
-    min_t = sampler._diff_conf.min_t
+    min_t = posterior_sampler._diff_conf.min_t
     dt = 1/num_t
 
-    log_pf = 0.0
+    log_pf_posterior = 0.0
+    log_pf_prior = 0.0
 
     ts = range(T, -1, -1)
     for t in ts:
         t_cts = np.linspace(min_t, 1.0, num_t+1)[t]
 
         # Extract and update sample feats
-        sample_feats = sampler.PF_cache['sample_feats']
         for k, v in sample_feats.items():
             if isinstance(v, torch.Tensor): sample_feats[k] = v.detach()
 
         # Update sample feats with new rigids and t feature
-        sample_feats['rigids_t'] = xt.to(sampler.device)
+        sample_feats['rigids_t'] = xt.to(posterior_sampler.device)
         xt_rigids = Rigid.from_tensor_7(xt)
-        sample_feats['R_t'] = xt_rigids.get_rots().get_rot_mats().to(sampler.device).to(torch.float64)
-        sample_feats['trans_t'] = xt_rigids.get_trans().to(sampler.device).to(torch.float64)
-        sample_feats = sampler.exp._set_t_feats(sample_feats, t_cts, sample_feats['t_placeholder'])
-        sampler.PF_cache['sample_feats'] = sample_feats
+        sample_feats['R_t'] = xt_rigids.get_rots().get_rot_mats().to(posterior_sampler.device).to(torch.float64)
+        sample_feats['trans_t'] = xt_rigids.get_trans().to(posterior_sampler.device).to(torch.float64)
+        sample_feats = posterior_sampler.exp._set_t_feats(sample_feats, t_cts, sample_feats['t_placeholder'])
 
         # Run model
-        model_out = sampler.exp.model(
-            sample_feats, F=sampler.PF_cache['F'],
+        model_out = posterior_sampler.exp.model(
+            sample_feats, F=F,
             use_twisting=False,
         )
-        self_conditioning = sampler.exp._model_conf.embed.embed_self_conditioning and not sampler._infer_conf.motif_scaffolding.no_self_conditioning
+        with torch.no_grad():
+            prior_out = prior_sampler.exp.model(
+                sample_feats, F=F,
+                use_twisting=False,
+            )
+        self_conditioning = posterior_sampler.exp._model_conf.embed.embed_self_conditioning and not posterior_sampler._infer_conf.motif_scaffolding.no_self_conditioning
         if self_conditioning: sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
 
-        # Detach model outputs and add to cache
-        for k, v in model_out.items():
-            if isinstance(v, torch.Tensor): model_out[k] = v.detach()
-        sampler.PF_cache['model_out'] = model_out
-
-
-        # model_out = self.PF_cache['model_out']
-        # sample_feats = self.PF_cache['sample_feats']
         rigid_pred = model_out['rigids']
 
         diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
-        rigids_t, log_Mt = sampler.exp.diffuser.reverse(
+        rigids_t, _ = posterior_sampler.exp.diffuser.reverse(
             rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
             rot_score=model_out['rot_score'],
             trans_score=model_out['trans_score'],
             diffuse_mask=diffuse_mask,
             t=t_cts,
             dt=dt,
-            noise_scale=sampler._diff_conf.noise_scale,
+            noise_scale=posterior_sampler._diff_conf.noise_scale,
             return_log_p_sample=True,
         )
-        # self.PF_cache['log_Mt'] = log_Mt
 
-        if sampler._infer_conf.aux_traj:
+        if posterior_sampler._infer_conf.aux_traj:
             # Calculate x0 prediction derived from score predictions.
-            if not "aux_traj" in sampler.PF_cache:
-                sampler.PF_cache['aux_traj'] = {'all_bb_0_pred': [], 'all_bb_prots': []}
-                sampler.PF_cache['max_log_p_idx_by_t'] = []
-            sampler.PF_cache['aux_traj']['all_bb_0_pred'].append(du.move_to_np(all_atom.compute_backbone(
+            if not "aux_traj" in posterior_sampler.PF_cache:
+                posterior_sampler.PF_cache['aux_traj'] = {'all_bb_0_pred': [], 'all_bb_prots': []}
+                posterior_sampler.PF_cache['max_log_p_idx_by_t'] = []
+            posterior_sampler.PF_cache['aux_traj']['all_bb_0_pred'].append(du.move_to_np(all_atom.compute_backbone(
                 ru.Rigid.from_tensor_7(rigid_pred), model_out['psi_pred'])[0]))
-            sampler.PF_cache['aux_traj']['all_bb_prots'].append(du.move_to_np(all_atom.compute_backbone(
+            posterior_sampler.PF_cache['aux_traj']['all_bb_prots'].append(du.move_to_np(all_atom.compute_backbone(
                 rigids_t, model_out['psi_pred'])[0]))
-            sampler.PF_cache['max_log_p_idx_by_t'].append(model_out['max_log_p_idx'])
+            posterior_sampler.PF_cache['max_log_p_idx_by_t'].append(model_out['max_log_p_idx'])
 
 
         # If the last step, return the model output not noised rigids
@@ -423,90 +414,127 @@ def sample_fn(sampler, motif_contig_info, batch_size,
             rigids_t = rigids_t.to_tensor_7().cpu().detach()
 
         # Add prot_traj and psi_pred with appropriate dimensios 0for validation
-        sampler.PF_cache['prot_traj'] = du.move_to_np(
+        prot_traj = du.move_to_np(
             all_atom.compute_backbone(ru.Rigid.from_tensor_7(
                 rigids_t), model_out['psi_pred'])[0])[None]
         model_out['psi_pred'] = model_out['psi_pred'][None]
+        
         xtp1 = rigids_t.detach()
 
 
-        log_p_model_uncond = sampler.exp.diffuser.reverse_log_prob(
+        posterior_log_prob = posterior_sampler.exp.diffuser.reverse_log_prob(
             rigid_t=xtp1,
             rigid_tm1=xt,
-            rot_score=sampler.PF_cache['model_out']['rot_score'],
-            trans_score=sampler.PF_cache['model_out']['trans_score'],
+            rot_score=model_out['rot_score'],
+            trans_score=model_out['trans_score'],
             t=t_cts,
             dt=dt,
         )
 
-        log_pf += log_p_model_uncond
+        with torch.no_grad():
+            prior_log_prob = prior_sampler.exp.diffuser.reverse_log_prob(
+                rigid_t=xtp1,
+                rigid_tm1=xt,
+                rot_score=prior_out['rot_score'],
+                trans_score=prior_out['trans_score'],
+                t=t_cts,
+                dt=dt,
+            )
+
+        log_pf_posterior += posterior_log_prob
+        log_pf_prior += prior_log_prob
         xt = xtp1
 
-    return xt, log_pf
+    return xt, log_pf_posterior, log_pf_prior, {
+        "prot_traj": prot_traj,
+        "F": F,
+        "all_motif_locations": all_motif_locations,
+        "rigids_motif": rigids_motif,
+        "all_rots": all_rots,
+        "model_out": model_out,
+    }
 
     
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="inference")
+@hydra.main(version_base=None, config_path="../config", config_name="rtb")
 def run(conf: DictConfig) -> None:
 
     # Read model checkpoint.
     print('Starting inference')
-    sampler = inference_motif_scaffolding.Sampler(conf)
-    torch.set_default_tensor_type('torch.FloatTensor')
-    output_dir_stem = sampler._output_dir
+    prior_sampler = inference_motif_scaffolding.Sampler(conf)
+    prior_sampler.exp.model.eval()
+    posterior_sampler = inference_motif_scaffolding.Sampler(conf)
 
-    assert not sampler._infer_conf.motif_scaffolding.use_replacement, "use_replacement not implemented for particle filter"
+
+    torch.set_default_tensor_type('torch.FloatTensor')
+    output_dir_stem = posterior_sampler._output_dir
+
+    assert not posterior_sampler._infer_conf.motif_scaffolding.use_replacement, "use_replacement not implemented for particle filter"
 
 
     # Load motif test case details
-    inpaint_df = pd.read_csv(sampler._infer_conf.motif_scaffolding.inpaint_cases_csv)
+    inpaint_df = pd.read_csv(posterior_sampler._infer_conf.motif_scaffolding.inpaint_cases_csv)
     contigs_by_test_case = save_motif_segments.load_contigs_by_test_case(inpaint_df)
-    if sampler._infer_conf.motif_scaffolding.test_name is not None:
-        test_names = [sampler._infer_conf.motif_scaffolding.test_name]
+    if posterior_sampler._infer_conf.motif_scaffolding.test_name is not None:
+        test_names = [posterior_sampler._infer_conf.motif_scaffolding.test_name]
         print("running on test case: ", test_names)
     else:
         test_names = ["2KL8", "1BCF", "1PRW", "6EXZ_long"]# , "6EXZ_short", "1YCR", "5TPN", "7MRX_85"]
         test_names = ["1PRW", "1QJG", "5TRV_short"]# , "6EXZ_short", "1YCR", "5TPN", "7MRX_85"]
         #test_names = [name for name in contigs_by_test_case.keys()]
 
-    for test_name in test_names:
-        print("starting test case: ", test_name)
-        motif_contig_info = contigs_by_test_case[test_name]
+    # for test_name in test_names:
+    test_name = posterior_sampler._infer_conf.motif_scaffolding.test_name
+    print("starting test case: ", test_name)
+    motif_contig_info = contigs_by_test_case[test_name]
 
-        sampler._output_dir = inference_motif_scaffolding.construct_output_dir(sampler, test_name, output_dir_stem)
-        print("output_dir: ",sampler._output_dir)
-        os.makedirs(sampler._output_dir, exist_ok=True)
+    posterior_sampler._output_dir = inference_motif_scaffolding.construct_output_dir(posterior_sampler, test_name, output_dir_stem)
+    print("output_dir: ",posterior_sampler._output_dir)
+    os.makedirs(posterior_sampler._output_dir, exist_ok=True)
+    
+    optimizer = torch.optim.Adam(posterior_sampler.exp.model.parameters(), lr=conf.inference.learning_rate)
+    optimizer.zero_grad()
 
-        for sample in range(sampler._infer_conf.motif_scaffolding.number_of_samples):
-            # Load in contig separately for each batch in order to sample a
-            # different length for the motif in the case that the contig is used
-            row = list(inpaint_df[inpaint_df.target==test_name].iterrows())[0][1]
-            motif_contig_info = save_motif_segments.load_contig_test_case(row)
-            import pdb; pdb.set_trace();
-            x, log_pf = sample_fn(sampler, motif_contig_info, batch_size=8,)
+    for step in range(conf.inference.training_steps):
+        # Load in contig separately for each batch in order to sample a
+        # different length for the motif in the case that the contig is used
+        row = list(inpaint_df[inpaint_df.target==test_name].iterrows())[0][1]
+        motif_contig_info = save_motif_segments.load_contig_test_case(row)
+        # import pdb; pdb.set_trace();
+        x, log_pf_posterior, log_pf_prior, extras = sample_fn(posterior_sampler, 
+                                                                prior_sampler, motif_contig_info, batch_size=2,)
+        logreward = 0
 
-            # run_particle_filter(
-            #     sampler=sampler,
-            #     motif_contig_info=motif_contig_info,
-            #     P=sampler._infer_conf.particle_filtering.number_of_particles,
-            #     sample_id=sample,
-            #     keep_motif_seq=sampler._infer_conf.motif_scaffolding.keep_motif_seq,
-            #     insert_motif_at_t0=sampler._infer_conf.particle_filtering.insert_motif_at_t0,
-            #     )
-        motif_segments = [
-            torch.tensor(motif_segment, dtype=torch.float64)
-            for motif_segment in motif_contig_info['motif_segments']
-            ]
-        rigids_motif = eu.remove_com_from_tensor_7(torch.cat([
-            motif_segment.to(sampler.device) for motif_segment in motif_segments
-            ], dim=0))
-        sampler.run_self_consistency(
-            sampler._output_dir,
-            rigids_motif=rigids_motif,
-            use_motif_seq=sampler._infer_conf.motif_scaffolding.keep_motif_seq,
-            motif_contig_info=motif_contig_info,
-            )
+        log_z_hat = (log_pf_posterior - log_pf_prior - logreward).mean().detach()
+        rtb_loss = ((log_pf_posterior - log_pf_prior - logreward + log_z_hat) ** 2).mean()
+
+        rtb_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        print("step: ", step, "rtb_loss: ", rtb_loss.item())
+        # run_particle_filter(
+        #     sampler=sampler,
+        #     motif_contig_info=motif_contig_info,
+        #     P=sampler._infer_conf.particle_filtering.number_of_particles,
+        #     sample_id=sample,
+        #     keep_motif_seq=sampler._infer_conf.motif_scaffolding.keep_motif_seq,
+        #     insert_motif_at_t0=sampler._infer_conf.particle_filtering.insert_motif_at_t0,
+        #     )
+    motif_segments = [
+        torch.tensor(motif_segment, dtype=torch.float64)
+        for motif_segment in motif_contig_info['motif_segments']
+        ]
+    rigids_motif = eu.remove_com_from_tensor_7(torch.cat([
+        motif_segment.to(posterior_sampler.device) for motif_segment in motif_segments
+        ], dim=0))
+    posterior_sampler.run_self_consistency(
+        posterior_sampler._output_dir,
+        rigids_motif=rigids_motif,
+        use_motif_seq=posterior_sampler._infer_conf.motif_scaffolding.keep_motif_seq,
+        motif_contig_info=motif_contig_info,
+        )
 
 if __name__ == '__main__':
     run()
