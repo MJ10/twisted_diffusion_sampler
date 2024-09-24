@@ -277,9 +277,9 @@ def run(conf: DictConfig) -> None:
     # Read model checkpoint.
     print('Starting inference')
     sampler = inference_motif_scaffolding.Sampler(conf)
+    sampler.load_folding_model()
     torch.set_default_tensor_type('torch.FloatTensor')
     output_dir_stem = sampler._output_dir
-
     assert not sampler._infer_conf.motif_scaffolding.use_replacement, "use_replacement not implemented for particle filter"
 
 

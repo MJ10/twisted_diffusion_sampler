@@ -1,6 +1,8 @@
 # Import feynman_kac_pf from a level down
 import sys
 import os
+import logging
+import subprocess as sp
 import torch
 import hydra
 import numpy as np
@@ -11,6 +13,7 @@ import shutil
 from data import utils as du
 from omegaconf import DictConfig, OmegaConf
 
+import wandb
 from smc_utils_prot import feynman_kac_pf, smc_utils
 from motif_scaffolding import save_motif_segments, twisting
 from motif_scaffolding import utils as mu
@@ -22,30 +25,32 @@ from experiments import utils as eu
 from openfold.utils.rigid_utils import Rigid
 from openfold.utils import rigid_utils as ru
 from analysis import utils as au
+from peft import LoraConfig, get_peft_model
 
-def align_outputs_on_motif(sampler, rigids_motif, insert_motif_at_t0=False):
+
+def align_outputs_on_motif(sampler, sampler_cache, idx, rigids_motif, insert_motif_at_t0=False):
     """align_outputs_on_motif aligns the outputs of the sampler on the motif.
 
     if insert_motif is True, then the motif is inserted into the protein.
 
     """
     # align sample output on the motif
-    sample_output = sampler.PF_cache["model_out"]
-    all_motif_locations = sampler.PF_cache["all_motif_locations"]
-    all_rots = sampler.PF_cache["all_rots"]
+    sample_output = sampler_cache["model_out"]
+    all_motif_locations = sampler_cache["all_motif_locations"]
+    all_rots = sampler_cache["all_rots"]
     psis = torch.zeros_like(rigids_motif[:, :2])
     atom37_motif = all_atom.compute_backbone(
         ru.Rigid.from_tensor_7(rigids_motif), psis)[0]
 
     max_log_p_idx = sample_output['max_log_p_idx'][0]
     motif_locations_b = all_motif_locations[max_log_p_idx]
-    sampler.PF_cache['prot_traj'][0, 0] = au.align_on_motif_bb(
-        torch.tensor(sampler.PF_cache['prot_traj'][0, 0]),
+    sampler_cache['prot_traj'][0, idx] = au.align_on_motif_bb(
+        torch.tensor(sampler_cache['prot_traj'][0, idx]),
         motif_locations_b,
         atom37_motif,
         insert_motif=insert_motif_at_t0)
-    if not "aux_traj" in sampler.PF_cache:
-        return
+    if not "aux_traj" in sampler_cache:
+        return sampler_cache
     all_bb_prots = sampler.PF_cache['aux_traj']['all_bb_prots']
     all_bb_0_pred = sampler.PF_cache['aux_traj']['all_bb_0_pred']
     max_log_p_idx_by_t = sampler.PF_cache['max_log_p_idx_by_t']
@@ -159,62 +164,61 @@ def init_particle_filter(sampler, motif_contig_info, P=4):
 
 
 def log_and_validate_PF_output(
-    sampler, log_w_trace, ess_trace, sample_id, sample_dir,
+    sampler, sampler_cache, sample_ids,
     keep_motif_seq=False, insert_motif_at_t0=False
     ):
     # Run self-consistency validation on the first particle
-    sample_output = sampler.PF_cache["model_out"]
-    all_motif_locations = sampler.PF_cache["all_motif_locations"]
-    length = sampler.PF_cache["length"]
-    rigids_motif = sampler.PF_cache["rigids_motif"]
-    motif_contig_info = sampler.PF_cache["motif_contig_info"]
-
-
-    ### Save log_w and ess_trace
-    # Save log_w to file
-    log_w_string = "\n".join(
-        ",".join([f"{w}" for w in log_w.detach().numpy()])
-        for log_w in log_w_trace)
-    log_w_fn = os.path.join(sample_dir, f"log_w_{sample_id}.txt")
-    with open(log_w_fn, "w") as f: f.write(log_w_string)
-
-    # Save ess_trace to file
-    ess_trace_string = ",".join([f"{ess:0.02f}" for ess in ess_trace.detach().numpy()])
-    ess_trace_fn = os.path.join(sample_dir, f"ess_trace_{sample_id}.txt")
-    with open(ess_trace_fn, "w") as f: f.write(ess_trace_string)
+    sample_output = sampler_cache["model_out"]
+    all_motif_locations = sampler_cache["all_motif_locations"]
+    length = sampler_cache["length"]
+    rigids_motif = sampler_cache["rigids_motif"]
+    motif_contig_info = sampler_cache["motif_contig_info"]
 
     # Compute / extract motif mask from output
     # TOD0: Adapt this to work with SMCDiff?
-    max_log_p_idx = sample_output['max_log_p_idx'][0]
-    motif_locations_b = all_motif_locations[max_log_p_idx]
+    for i in range(len(sample_ids)):
+        # Check if we've already run this sample
+        sample_id = sample_ids[i]
+        max_log_p_idx = sample_output['max_log_p_idx'][i]
+        motif_locations_b = all_motif_locations[max_log_p_idx]
 
-    # Set positions of the motif in the sequence to the prescribed amino acids
-    aatype = np.zeros([length], dtype=np.int32) # Default to Alanine
-    for i, (st, end) in enumerate(motif_locations_b):
-        aatype[st:end+1] = motif_contig_info['aatype'][i]
+        # Set positions of the motif in the sequence to the prescribed amino acids
+        aatype = np.zeros([length], dtype=np.int32) # Default to Alanine
+        for j, (st, end) in enumerate(motif_locations_b):
+            aatype[st:end+1] = motif_contig_info['aatype'][j]
+        sample_dir = os.path.join(sampler._output_dir, f'length_{sampler_cache["length"]}', f'sample_{sample_id}')
+        if os.path.isdir(sample_dir):
+            print("Skipping sample, prev sample already run", sample_id)
+            continue
+        os.makedirs(sample_dir, exist_ok=True)
+        # Save motif locations to file
+        motif_segments_string = ",".join([f"{st}_{end}" for st, end in motif_locations_b])
+        motif_segments_fn = os.path.join(sample_dir, f"motif_segments_{sample_id}.txt")
+        with open(motif_segments_fn, "w") as f:
+            f.write(motif_segments_string)
 
+        # Use b-factors to specify which residues are diffused.
+        b_factors = np.tile((np.ones(length) * 100)[:, None], (1, 37))
+        
+        
+        sample_path = os.path.join(sample_dir, 'sample')
 
-    # Save motif locations to file
-    motif_segments_string = ",".join([f"{st}_{end}" for st, end in motif_locations_b])
-    motif_segments_fn = os.path.join(sample_dir, f"motif_segments_{sample_id}.txt")
-    with open(motif_segments_fn, "w") as f:
-        f.write(motif_segments_string)
+        sampler_cache = align_outputs_on_motif(sampler, sampler_cache, i, rigids_motif,
+                insert_motif_at_t0=insert_motif_at_t0)
 
-    # Use b-factors to specify which residues are diffused.
-    b_factors = np.tile((np.ones(length) * 100)[:, None], (1, 37))
-    sample_path = os.path.join(sample_dir, 'sample')
-
-
-
-    align_outputs_on_motif(sampler, rigids_motif,
-            insert_motif_at_t0=insert_motif_at_t0)
-
-    pdb_path = au.write_prot_to_pdb(
-        sampler.PF_cache['prot_traj'][:, 0][0],
-        sample_path,
-        aatype=aatype,
-        b_factors=b_factors
-    )
+        pdb_path = au.write_prot_to_pdb(
+            sampler_cache['prot_traj'][:, i][0],
+            sample_path,
+            aatype=aatype,
+            b_factors=b_factors
+        )
+        
+        # Run ProteinMPNN
+        sc_output_dir = os.path.join(sample_dir, 'self_consistency')
+        os.makedirs(sc_output_dir, exist_ok=True)
+        shutil.copy(pdb_path, os.path.join(
+            sc_output_dir, os.path.basename(pdb_path)))
+        
     if sampler._infer_conf.aux_traj:
         T = len(sampler.PF_cache['aux_traj']['all_bb_prots'])
         P = sampler.PF_cache['prot_traj'][0].shape[0]
@@ -229,11 +233,6 @@ def log_and_validate_PF_output(
                     diffuse_mask[t, p, st:end+1] = 1
         save_aux_traj(sampler, sample_dir, aatype, diffuse_mask=diffuse_mask)
 
-    # Run ProteinMPNN
-    sc_output_dir = os.path.join(sample_dir, 'self_consistency')
-    os.makedirs(sc_output_dir, exist_ok=True)
-    shutil.copy(pdb_path, os.path.join(
-        sc_output_dir, os.path.basename(pdb_path)))
 
 
 def run_particle_filter(sampler, motif_contig_info, P=4, sample_id=0,
@@ -270,14 +269,42 @@ def run_particle_filter(sampler, motif_contig_info, P=4, sample_id=0,
     log_and_validate_PF_output(sampler, log_w_trace, ess_trace, sample_id, sample_dir=sample_dir,
         keep_motif_seq=keep_motif_seq, insert_motif_at_t0=insert_motif_at_t0)
 
+def likelihood_fn(rigids_pred, rigids_obs, sampler, F, sigma):
+    """
+    Based on https://github.com/blt2114/twisted_diffusion_sampler/blob/main/protein_exp/motif_scaffolding/twisting.py#L234
+    """
+    diffuser = sampler.exp.diffuser
 
-def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size, 
+    R_pred = Rigid.from_tensor_7(rigids_pred).get_rots().get_rot_mats().to(torch.device(sampler.device), rigids_pred.dtype)
+    x_pred = Rigid.from_tensor_7(rigids_pred).get_trans().to(torch.device(sampler.device))
+
+    R_pred, x_pred = F(R_pred, x_pred)
+    rigids_obs = rigids_obs.unsqueeze(0)
+    R_obs = Rigid.from_tensor_7(rigids_obs).get_rots().get_rot_mats().to(torch.device(sampler.device), rigids_pred.dtype)
+    x_obs = Rigid.from_tensor_7(rigids_obs).get_trans().to(torch.device(sampler.device))
+
+    # Compute term likelihood term for rotations
+    log_p = 0.
+    # Frobenius norm approximation to tangent normal density
+    log_p += -((R_pred - R_obs[None, None]).pow(2)/(sigma)).sum(dim=[-3, -2, -1])
+
+    # Compute term likelihood term for translations
+    # scale down x_pred and x_obs
+    x_pred = diffuser._r3_diffuser._scale(x_pred)
+    x_obs = diffuser._r3_diffuser._scale(x_obs)
+
+    log_p += -(((x_obs - x_pred)**2)/(sigma)).sum(dim=[-1, -2])
+
+    return log_p.logsumexp(dim=-1), log_p.argmax(dim=-1)
+
+
+def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size, detach_freq=0.7, 
            keep_motif_seq=False, verbose=False, insert_motif_at_t0=False):
-    posterior_sampler.PF_cache = {}
+    # posterior_sampler.PF_cache = {}
     motif_segments = [torch.tensor(motif_segment, dtype=torch.float64) for motif_segment in motif_contig_info['motif_segments']]
     rigids_motif = eu.remove_com_from_tensor_7(
         torch.cat([motif_segment.to(posterior_sampler.device) for motif_segment in motif_segments], dim=0))
-    posterior_sampler.PF_cache["rigids_motif"] = rigids_motif
+    # posterior_sampler.PF_cache["rigids_motif"] = rigids_motif
 
     if posterior_sampler._infer_conf.motif_scaffolding.use_contig_for_placement:
         num_DOF = posterior_sampler._infer_conf.motif_scaffolding.num_rots*posterior_sampler._infer_conf.motif_scaffolding.max_offsets
@@ -300,9 +327,6 @@ def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
         device=posterior_sampler.device,
         max_offsets=posterior_sampler._infer_conf.motif_scaffolding.max_offsets,
         return_rots=True)
-    # posterior_sampler.PF_cache["F"] = F
-    # posterior_sampler.PF_cache["all_motif_locations"] = all_motif_locations
-    # posterior_sampler.PF_cache["all_rots"] = all_rots
 
 
     # Initialize sample_feats
@@ -355,6 +379,7 @@ def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
 
     ts = range(T, -1, -1)
     for t in ts:
+        # print(t)
         t_cts = np.linspace(min_t, 1.0, num_t+1)[t]
 
         # Extract and update sample feats
@@ -429,7 +454,7 @@ def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
             trans_score=model_out['trans_score'],
             t=t_cts,
             dt=dt,
-        )
+        ).to(posterior_sampler.device)
 
         with torch.no_grad():
             prior_log_prob = prior_sampler.exp.diffuser.reverse_log_prob(
@@ -439,9 +464,8 @@ def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
                 trans_score=prior_out['trans_score'],
                 t=t_cts,
                 dt=dt,
-            )
-
-        log_pf_posterior += posterior_log_prob
+            ).to(posterior_sampler.device)
+        log_pf_posterior += posterior_log_prob if np.random.uniform() > detach_freq else posterior_log_prob.detach()
         log_pf_prior += prior_log_prob
         xt = xtp1
 
@@ -452,23 +476,49 @@ def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
         "rigids_motif": rigids_motif,
         "all_rots": all_rots,
         "model_out": model_out,
+        "motif_contig_info": motif_contig_info,
+        "length": length,
     }
 
-    
+
+def get_gpu_memory():
+    output_to_list = lambda x: x.decode('ascii').split('\n')[:-1]
+    ACCEPTABLE_AVAILABLE_MEMORY = 1024
+    COMMAND = "nvidia-smi --query-gpu=memory.used --format=csv"
+    try:
+        memory_use_info = output_to_list(sp.check_output(COMMAND.split(),stderr=sp.STDOUT))[1:]
+    except sp.CalledProcessError as e:
+        raise RuntimeError("command '{}' return with error (code {}): {}".format(e.cmd, e.returncode, e.output))
+    memory_use_values = [int(x.split()[0]) for i, x in enumerate(memory_use_info)]
+    # print(memory_use_values)
+    return memory_use_values
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="rtb")
 def run(conf: DictConfig) -> None:
-
+    logger = logging.getLogger(__name__)
     # Read model checkpoint.
-    print('Starting inference')
+    logger.info('Starting inference')
+
+    wandb.init(project="protein-inverse-prob", config=OmegaConf.to_container(conf, resolve=True), mode=conf.inference.wandb_mode)
+
+    posterior_sampler = inference_motif_scaffolding.Sampler(conf)
+    peft_model = get_peft_model(posterior_sampler.exp.model, LoraConfig(
+        target_modules=["linear"],
+        r=16,
+        lora_alpha=32
+    ))
+    posterior_sampler.exp.replace_model(peft_model)
+    posterior_sampler.exp.model.print_trainable_parameters()
+    logger.info("GPU memory: " + str(get_gpu_memory()))
+    
     prior_sampler = inference_motif_scaffolding.Sampler(conf)
     prior_sampler.exp.model.eval()
-    posterior_sampler = inference_motif_scaffolding.Sampler(conf)
-
-
     torch.set_default_tensor_type('torch.FloatTensor')
     output_dir_stem = posterior_sampler._output_dir
+    logger.info("GPU memory: " + str(get_gpu_memory()))
+    trainable_params = sum(p.numel() for p in posterior_sampler.exp.model.parameters() if p.requires_grad)
+    logger.info(f"Trainable parameters: {str(trainable_params)}")
 
     assert not posterior_sampler._infer_conf.motif_scaffolding.use_replacement, "use_replacement not implemented for particle filter"
 
@@ -478,7 +528,7 @@ def run(conf: DictConfig) -> None:
     contigs_by_test_case = save_motif_segments.load_contigs_by_test_case(inpaint_df)
     if posterior_sampler._infer_conf.motif_scaffolding.test_name is not None:
         test_names = [posterior_sampler._infer_conf.motif_scaffolding.test_name]
-        print("running on test case: ", test_names)
+        logger.info("running on test case: " + str(test_names))
     else:
         test_names = ["2KL8", "1BCF", "1PRW", "6EXZ_long"]# , "6EXZ_short", "1YCR", "5TPN", "7MRX_85"]
         test_names = ["1PRW", "1QJG", "5TRV_short"]# , "6EXZ_short", "1YCR", "5TPN", "7MRX_85"]
@@ -486,42 +536,64 @@ def run(conf: DictConfig) -> None:
 
     # for test_name in test_names:
     test_name = posterior_sampler._infer_conf.motif_scaffolding.test_name
-    print("starting test case: ", test_name)
+    logger.info("starting test case: " + test_name)
     motif_contig_info = contigs_by_test_case[test_name]
 
     posterior_sampler._output_dir = inference_motif_scaffolding.construct_output_dir(posterior_sampler, test_name, output_dir_stem)
-    print("output_dir: ",posterior_sampler._output_dir)
+    logger.info("output_dir: " + str(posterior_sampler._output_dir))
     os.makedirs(posterior_sampler._output_dir, exist_ok=True)
     
     optimizer = torch.optim.Adam(posterior_sampler.exp.model.parameters(), lr=conf.inference.learning_rate)
     optimizer.zero_grad()
+    logger.info("Starting RTB training")
 
     for step in range(conf.inference.training_steps):
+        if step < conf.inference.sigma_anneal_steps:
+            if conf.inference.sigma_anneal_scheme == "linear":
+                start_sigma = conf.inference.start_sigma
+                end_sigma = conf.inference.end_sigma
+                steps = conf.inference.sigma_anneal_steps
+                curr_sigma = start_sigma + (end_sigma - start_sigma) * (step / steps)
+            elif conf.inference.sigma_anneal_scheme == "exp":
+                start_sigma = conf.inference.start_sigma
+                end_sigma = conf.inference.end_sigma
+                steps = conf.inference.sigma_anneal_steps
+                curr_sigma = start_sigma * (end_sigma / start_sigma) ** (step / steps)
+            elif conf.inference.sigma_anneal_scheme == "none":
+                curr_sigma = conf.inference.start_sigma
+
         # Load in contig separately for each batch in order to sample a
         # different length for the motif in the case that the contig is used
         row = list(inpaint_df[inpaint_df.target==test_name].iterrows())[0][1]
         motif_contig_info = save_motif_segments.load_contig_test_case(row)
-        # import pdb; pdb.set_trace();
         x, log_pf_posterior, log_pf_prior, extras = sample_fn(posterior_sampler, 
-                                                                prior_sampler, motif_contig_info, batch_size=2,)
-        logreward = 0
-
-        log_z_hat = (log_pf_posterior - log_pf_prior - logreward).mean().detach()
+                                                                prior_sampler, motif_contig_info, batch_size=conf.inference.batch_size,)
+        
+        logreward, _ = likelihood_fn(x, extras['rigids_motif'], posterior_sampler, extras["F"], curr_sigma)
+        log_z_hat = (- log_pf_posterior + log_pf_prior + logreward).mean().detach()
         rtb_loss = ((log_pf_posterior - log_pf_prior - logreward + log_z_hat) ** 2).mean()
-
+        wandb.log({
+            "rtb_loss": rtb_loss.item(), 
+            "logreward": logreward.mean().item()
+        })
         rtb_loss.backward()
         optimizer.step()
         optimizer.zero_grad()
+        print("step: ", step, "rtb_loss: ", rtb_loss.item(), " logreward: ", logreward.mean().item())
 
-        print("step: ", step, "rtb_loss: ", rtb_loss.item())
-        # run_particle_filter(
-        #     sampler=sampler,
-        #     motif_contig_info=motif_contig_info,
-        #     P=sampler._infer_conf.particle_filtering.number_of_particles,
-        #     sample_id=sample,
-        #     keep_motif_seq=sampler._infer_conf.motif_scaffolding.keep_motif_seq,
-        #     insert_motif_at_t0=sampler._infer_conf.particle_filtering.insert_motif_at_t0,
-        #     )
+    logger.info("RTB training complete. Saving checkpoint")
+    torch.save(posterior_sampler.exp.model.state_dict(), "model.pth")
+    logger.info("Generating test samples")
+    for i in range((conf.inference.motif_scaffolding.number_of_samples // conf.inference.eval_batch_size) + 1):
+        ids = list(range(i*conf.inference.eval_batch_size, (i+1)*conf.inference.eval_batch_size))
+        ids = [id for id in ids if id < conf.inference.motif_scaffolding.number_of_samples]
+        with torch.no_grad():
+            x, log_pf_posterior, log_pf_prior, extras = sample_fn(posterior_sampler, 
+                                                                    prior_sampler, motif_contig_info, batch_size=len(ids),)
+            logreward, idxs = likelihood_fn(x, extras['rigids_motif'], posterior_sampler, extras["F"], conf.inference.start_sigma)
+            extras['model_out']['max_log_p_idx'] = idxs.squeeze().cpu()
+            log_and_validate_PF_output(posterior_sampler, extras, ids)
+
     motif_segments = [
         torch.tensor(motif_segment, dtype=torch.float64)
         for motif_segment in motif_contig_info['motif_segments']
@@ -529,6 +601,10 @@ def run(conf: DictConfig) -> None:
     rigids_motif = eu.remove_com_from_tensor_7(torch.cat([
         motif_segment.to(posterior_sampler.device) for motif_segment in motif_segments
         ], dim=0))
+    
+    logger.info("Loading folding model")
+    posterior_sampler.load_folding_model()
+    logger.info("Running self consistency eval")
     posterior_sampler.run_self_consistency(
         posterior_sampler._output_dir,
         rigids_motif=rigids_motif,

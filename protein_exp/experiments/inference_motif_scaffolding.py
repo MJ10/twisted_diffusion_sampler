@@ -67,6 +67,14 @@ def construct_output_dir(sampler, test_name, output_dir_stem):
 
     # Name and create output directory
     name_segments = [test_name + "/"]
+    if sampler._infer_conf.name.startswith("rtb"):
+        name_segments.append("rtb")
+        name_segments.append(f"start{sampler._infer_conf.start_sigma}")
+        name_segments.append(f"end{sampler._infer_conf.end_sigma}")
+        name_segments.append(f"steps{sampler._infer_conf.training_steps}")
+        name_segments.append(f"lr{sampler._infer_conf.learning_rate}")
+        output_dir = os.path.join(output_dir_stem, '_'.join(name_segments))
+        return output_dir
 
     if sampler._infer_conf.motif_scaffolding.use_twisting:
         name_segments.append(f'twisting_{twist_scale:02.2f}')
@@ -186,6 +194,10 @@ class Sampler:
 
         # Load models and experiment
         self._load_ckpt(conf_overrides)
+        # self._folding_model = esm.pretrained.esmfold_v1().eval()
+        # self._folding_model = self._folding_model.to(self.device)
+
+    def load_folding_model(self):
         self._folding_model = esm.pretrained.esmfold_v1().eval()
         self._folding_model = self._folding_model.to(self.device)
 

@@ -140,6 +140,12 @@ class Experiment:
     def diffuser(self):
         return self._diffuser
 
+    def replace_model(self, new_model):
+        self._model = None
+        self._optimizer = None
+        torch.cuda.empty_cache()
+        self._model = new_model
+
     @property
     def model(self):
         return self._model
