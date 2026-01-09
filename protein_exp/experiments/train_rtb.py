@@ -298,6 +298,228 @@ def likelihood_fn(rigids_pred, rigids_obs, sampler, F, sigma):
     return log_p.logsumexp(dim=-1), log_p.argmax(dim=-1)
 
 
+def sample(posterior_sampler, prior_sampler, motif_contig_info, batch_size,
+              keep_motif_seq=False, verbose=False, insert_motif_at_t0=False):
+    # posterior_sampler.PF_cache = {}
+    motif_segments = [torch.tensor(motif_segment, dtype=torch.float64) for motif_segment in motif_contig_info['motif_segments']]
+    rigids_motif = eu.remove_com_from_tensor_7(
+        torch.cat([motif_segment.to(posterior_sampler.device) for motif_segment in motif_segments], dim=0))
+    # posterior_sampler.PF_cache["rigids_motif"] = rigids_motif
+
+    if posterior_sampler._infer_conf.motif_scaffolding.use_contig_for_placement:
+        num_DOF = posterior_sampler._infer_conf.motif_scaffolding.num_rots*posterior_sampler._infer_conf.motif_scaffolding.max_offsets
+        assert num_DOF == 1, f"sampling using contig supported only for no DOF {num_DOF}"
+
+    assert not posterior_sampler._infer_conf.motif_scaffolding.use_replacement, "replacement not supported for PF"
+    
+    # Check if number of possible rotations and translations is 1 and sample motif if so
+    if posterior_sampler._infer_conf.motif_scaffolding.num_rots == 1 and posterior_sampler._infer_conf.motif_scaffolding.max_offsets == 1:
+        motif_locations, length = posterior_sampler.motif_locations_and_length(
+            motif_segments, motif_contig_info, batch_size)
+    else:
+        motif_locations, length = None, motif_contig_info['length_fixed']
+    # posterior_sampler.PF_cache["motif_locations"] = motif_locations
+    # posterior_sampler.PF_cache["length"] = length
+
+    # Compute vectorized function for degrees of freedom computation
+    F, all_motif_locations, all_rots = twisting.motif_offsets_and_rots_vec_F(
+        length, motif_segments, motif_locations=motif_locations, num_rots=posterior_sampler._infer_conf.motif_scaffolding.num_rots,
+        device=posterior_sampler.device,
+        max_offsets=posterior_sampler._infer_conf.motif_scaffolding.max_offsets,
+        return_rots=True)
+
+
+    # Initialize sample_feats
+    res_mask = np.ones([batch_size, length])
+    fixed_mask = np.zeros_like(res_mask)
+    sample_feats = {
+        'res_mask': res_mask,
+        'seq_idx': torch.arange(1, length+1).repeat(batch_size, 1),
+        'fixed_mask': fixed_mask,
+        'torsion_angles_sin_cos': np.zeros((batch_size, length, 7, 2)),
+        'sc_ca_t': np.zeros((batch_size, length, 3)),
+        'motif_locations': motif_locations, # list of length batch_size of lists of motif segment locations
+        't_placeholder': torch.ones((batch_size,)),
+        'rigids_motif': rigids_motif,
+    }
+
+    # Add move to torch and GPU
+    sample_feats = tree.map_structure(lambda x: x if (x is None or torch.is_tensor(x)) else torch.tensor(x), sample_feats)
+    sample_feats = tree.map_structure(lambda x: x if x is None else x.to(posterior_sampler.device), sample_feats)
+
+    ref_sample = posterior_sampler.diffuser.sample_ref(
+        n_samples=length * batch_size,
+        as_tensor_7=True)
+    rigid_t = Rigid.from_tensor_7(ref_sample['rigids_t'].reshape(batch_size, length, 7))
+    sample_feats['R_t'] = rigid_t.get_rots().get_rot_mats().to(torch.float64)
+    sample_feats['trans_t'] = rigid_t.get_trans().to(torch.float64)
+    sample_feats['rigids_t'] = rigid_t.to_tensor_7().to(torch.float64)
+    # Move all tensors in sample_feats onto device
+    for k, v in sample_feats.items():
+        if isinstance(v, torch.Tensor):
+            sample_feats[k] = v.to(posterior_sampler.device)
+
+    t_cts = 1.0
+    self_conditioning = posterior_sampler.exp._model_conf.embed.embed_self_conditioning and not posterior_sampler._infer_conf.motif_scaffolding.no_self_conditioning
+    if self_conditioning:
+        sample_feats = posterior_sampler.exp._set_t_feats(
+            sample_feats, t_cts, sample_feats['t_placeholder'])
+        sample_feats = posterior_sampler.exp._self_conditioning(sample_feats)
+        # posterior_sampler.PF_cache['sample_feats'] = sample_feats
+    
+    xt = rigid_t.to_tensor_7().cpu().detach()
+
+    num_t = posterior_sampler._diff_conf.num_t
+    T = num_t
+    min_t = posterior_sampler._diff_conf.min_t
+    dt = 1/num_t
+
+    log_pf_posterior = 0.0
+    log_pf_prior = 0.0
+
+    ts = range(T, -1, -1)
+    model_ins = []
+    xts = []
+    xtp1s = []
+    for t in ts:
+        # print(t)
+        t_cts = np.linspace(min_t, 1.0, num_t+1)[t]
+
+        # Extract and update sample feats
+        for k, v in sample_feats.items():
+            if isinstance(v, torch.Tensor): sample_feats[k] = v.detach()
+
+        # Update sample feats with new rigids and t feature
+        sample_feats['rigids_t'] = xt.to(posterior_sampler.device)
+        xt_rigids = Rigid.from_tensor_7(xt)
+        sample_feats['R_t'] = xt_rigids.get_rots().get_rot_mats().to(posterior_sampler.device).to(torch.float64)
+        sample_feats['trans_t'] = xt_rigids.get_trans().to(posterior_sampler.device).to(torch.float64)
+        sample_feats = posterior_sampler.exp._set_t_feats(sample_feats, t_cts, sample_feats['t_placeholder'])
+        xts.append(xt)
+        model_ins.append(sample_feats)
+        
+        with torch.no_grad():
+            # Run model
+            model_out = posterior_sampler.exp.model(
+                sample_feats, F=F,
+                use_twisting=False,
+            )
+            prior_out = prior_sampler.exp.model(
+                sample_feats, F=F,
+                use_twisting=False,
+            )
+        self_conditioning = posterior_sampler.exp._model_conf.embed.embed_self_conditioning and not posterior_sampler._infer_conf.motif_scaffolding.no_self_conditioning
+        if self_conditioning: sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
+
+        rigid_pred = model_out['rigids']
+
+        diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
+        rigids_t, _ = posterior_sampler.exp.diffuser.reverse(
+            rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
+            rot_score=model_out['rot_score'],
+            trans_score=model_out['trans_score'],
+            diffuse_mask=diffuse_mask,
+            t=t_cts,
+            dt=dt,
+            noise_scale=posterior_sampler._diff_conf.noise_scale,
+            return_log_p_sample=True,
+        )
+
+        if posterior_sampler._infer_conf.aux_traj:
+            # Calculate x0 prediction derived from score predictions.
+            if not "aux_traj" in posterior_sampler.PF_cache:
+                posterior_sampler.PF_cache['aux_traj'] = {'all_bb_0_pred': [], 'all_bb_prots': []}
+                posterior_sampler.PF_cache['max_log_p_idx_by_t'] = []
+            posterior_sampler.PF_cache['aux_traj']['all_bb_0_pred'].append(du.move_to_np(all_atom.compute_backbone(
+                ru.Rigid.from_tensor_7(rigid_pred), model_out['psi_pred'])[0]))
+            posterior_sampler.PF_cache['aux_traj']['all_bb_prots'].append(du.move_to_np(all_atom.compute_backbone(
+                rigids_t, model_out['psi_pred'])[0]))
+            posterior_sampler.PF_cache['max_log_p_idx_by_t'].append(model_out['max_log_p_idx'])
+
+
+        # If the last step, return the model output not noised rigids
+        if t==0:
+            rigids_t = rigid_pred.cpu().detach()
+        else:
+            rigids_t = rigids_t.to_tensor_7().cpu().detach()
+
+        # Add prot_traj and psi_pred with appropriate dimensios 0for validation
+        prot_traj = du.move_to_np(
+            all_atom.compute_backbone(ru.Rigid.from_tensor_7(
+                rigids_t), model_out['psi_pred'])[0])[None]
+        model_out['psi_pred'] = model_out['psi_pred'][None]
+        
+        xtp1 = rigids_t.detach()
+        xtp1s.append(xtp1)
+
+        with torch.no_grad():
+            posterior_log_prob = posterior_sampler.exp.diffuser.reverse_log_prob(
+                rigid_t=xtp1,
+                rigid_tm1=xt,
+                rot_score=model_out['rot_score'],
+                trans_score=model_out['trans_score'],
+                t=t_cts,
+                dt=dt,
+            ).to(posterior_sampler.device)
+            
+            prior_log_prob = prior_sampler.exp.diffuser.reverse_log_prob(
+                rigid_t=xtp1,
+                rigid_tm1=xt,
+                rot_score=prior_out['rot_score'],
+                trans_score=prior_out['trans_score'],
+                t=t_cts,
+                dt=dt,
+            ).to(posterior_sampler.device)
+        log_pf_posterior += posterior_log_prob
+        log_pf_prior += prior_log_prob
+        xt = xtp1
+
+    return xt, log_pf_posterior, log_pf_prior, (model_ins, xts, xtp1s), {
+        "prot_traj": prot_traj,
+        "F": F,
+        "all_motif_locations": all_motif_locations,
+        "rigids_motif": rigids_motif,
+        "all_rots": all_rots,
+        "model_out": model_out,
+        "motif_contig_info": motif_contig_info,
+        "length": length,
+    }
+
+def train_step(posterior_sampler, prior_sampler, motif_contig_info, batch_size, sampler_out, sigma=1.0):
+    # Run one step of training
+    # Compute log likelihood
+    xt, log_pf_posterior, log_pf_prior, (model_ins, xts, xtp1s), sampler_cache = sampler_out
+    log_likelihood, max_log_p_idx = likelihood_fn(
+        xt, sampler_cache['rigids_motif'], posterior_sampler, sampler_cache['F'], sigma=sigma)
+    log_z_hat = (- log_pf_posterior + log_pf_prior + log_likelihood).mean().detach()
+
+
+    num_t = posterior_sampler._diff_conf.num_t
+    T = num_t
+    min_t = posterior_sampler._diff_conf.min_t
+    dt = 1/num_t
+
+    ts = range(T, -1, -1)
+    
+    for t in ts:
+        t_cts = np.linspace(min_t, 1.0, num_t+1)[t]
+        model_out = posterior_sampler.exp.model(
+            sample_feats, F=F,
+            use_twisting=False,
+        )
+        posterior_log_prob = posterior_sampler.exp.diffuser.reverse_log_prob(
+            rigid_t=xtp1,
+            rigid_tm1=xt,
+            rot_score=model_out['rot_score'],
+            trans_score=model_out['trans_score'],
+            t=t_cts,
+            dt=dt,
+        ).to(posterior_sampler.device)
+    posterior_sampler.optimizer.step()
+    posterior_sampler.optimizer.zero_grad()
+    return loss.item()
+
+
 def sample_fn(posterior_sampler, prior_sampler, motif_contig_info, batch_size, detach_freq=0.7, 
            keep_motif_seq=False, verbose=False, insert_motif_at_t0=False):
     # posterior_sampler.PF_cache = {}
